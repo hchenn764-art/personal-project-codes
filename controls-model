@@ -1,0 +1,159 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp, cumulative_trapezoid
+
+Q_nom = 280.0        # Ah, cell capacity (EVE datasheet)
+V_nom = 3.2          # V, nominal voltage (EVE datasheet)
+mcp   = 5241.0       # J/K, thermal mass (5.42 kg x ~967 J/kg-K)
+R0    = 0.43e-3      # ohm, internal resistance (literature)
+UA    = 1.5          # W/K, heat loss to air (assumed)
+tau   = mcp / UA     # s, thermal time constant
+
+Rg       = 8.314                 # J/mol-K
+T_ref    = 298.15                # K (25 C)
+k_cyc    = 20.0 / 6000.0         # % capacity lost per full cycle at 25 C (datasheet: 6000 cycles -> 80%)
+Ea_cyc   = 31700.0               # J/mol, cycle aging activation energy (Wang et al. 2011)
+k_cal    = 0.0011855             # % per day at 25 C, calendar aging (backed out from normal-day result)
+Ea_cal   = 32369.0               # J/mol, calendar aging activation energy (backed out from heat-wave result)
+
+# CLOUDY DAY SIMULATION
+
+def P_solar(h):
+    """Solar power on one cell (W): bell curve 7am-7pm with four passing clouds."""
+    base = np.where((h > 7) & (h < 19), 190 * np.abs(np.sin(np.pi * (h - 7) / 12))**1.5, 0.0)
+    clouds = (np.exp(-((h - 10.0) / 0.12)**2) + np.exp(-((h - 11.5) / 0.12)**2)
+              + np.exp(-((h - 12.6) / 0.10)**2) + np.exp(-((h - 13.3) / 0.10)**2))
+    return base * np.clip(1 - 0.85 * clouds, 0.1, 1)
+
+def P_load(h):
+    """House demand on one cell (W): morning, midday and evening peaks."""
+    return (25 + 30 * np.exp(-((h - 7.5) / 1.2)**2)
+               + 35 * np.exp(-((h - 13) / 2.5)**2)
+               + 75 * np.exp(-((h - 20) / 1.5)**2))
+
+def current(h):
+    """Battery current (A): + = discharge, - = charge. I = (P_load - P_solar) / V_nom."""
+    return np.clip((P_load(h) - P_solar(h)) / V_nom, -45, 45)
+
+def T_air_normal(h):   # air 23.2 -> 26.7 C, peak ~3 pm
+    return 24.97 - 1.75 * np.cos(2 * np.pi * (h - 3) / 24)
+
+# THERMAL MODEL
+
+def T_air_heatwave(h): # air 26.8 -> 39.8 C, peak ~3 pm
+    return 33.3 - 6.5 * np.cos(2 * np.pi * (h - 3) / 24)
+
+def simulate(T_air):
+    def rhs(t, T):
+        h = t / 3600
+        return [(current(h)**2 * R0 - UA * (T[0] - T_air(h))) / mcp]
+    t = np.linspace(0, 24 * 3600, 1441)              # 1-minute steps
+    sol = solve_ivp(rhs, [0, t[-1]], [T_air(0)], t_eval=t, max_step=30)
+    return t, sol.y[0]
+
+t, T_norm = simulate(T_air_normal)
+_, T_hot  = simulate(T_air_heatwave)
+h = t / 3600
+I = current(h)
+
+# AGING MODEL
+
+def f_arr(T_C, Ea):
+    """Arrhenius speed-up factor relative to 25 C (= 1 at 25 C)."""
+    return np.exp(-Ea / Rg * (1 / (T_C + 273.15) - 1 / T_ref))
+
+def aging(T):
+    rate_cyc = k_cyc * f_arr(T, Ea_cyc) * np.abs(I) / (2 * Q_nom * 3600)   # %/s
+    rate_cal = k_cal * f_arr(T, Ea_cal) / 86400                            # %/s
+    cum_cyc = cumulative_trapezoid(rate_cyc, t, initial=0)
+    cum_cal = cumulative_trapezoid(rate_cal, t, initial=0)
+    return cum_cyc, cum_cal, cum_cyc + cum_cal
+
+cyc_n, cal_n, loss_n = aging(T_norm)
+cyc_h, cal_h, loss_h = aging(T_hot)
+
+# STATE OF HEALTH CALCULATIONS
+
+day_loss = {'Normal cloudy day': loss_n[-1],   # % lost in one simulated day (from section 4)
+            'Heat wave':         loss_h[-1]}
+
+years = np.linspace(0, 18, 400)
+colors = {'Normal cloudy day': '#5E9E5E', 'Heat wave': '#D4A84B'}
+
+fig, ax = plt.subplots(figsize=(7.2, 4.6), dpi=150)
+for lab, d in day_loss.items():
+    soh = 100 - d * 365 * years              # SOH(%) if every day were like this one
+    eol = 20 / (d * 365)                     # years until 20% is lost (80% SOH)
+    c = colors[lab]
+    ax.plot(years, soh, color=c, lw=2.4, label=f'{lab}: {d:.4f}%/day -> 80% in {eol:.1f} yr')
+    ax.plot(eol, 80, 'o', color=c, ms=6)
+    ax.text(eol, 75.3, f'{eol:.1f} yr', color=c, ha='center', va='top', fontsize=10, weight='bold')
+    print(f'{lab:18s} {d:.4f} %/day   SOH after 1 yr = {100 - d*365:.2f}%   80% reached in {eol:.1f} yr')
+
+ax.axhline(80, color='grey', lw=1, ls=':'); ax.text(0.2, 80.5, 'end of life (80%)', color='grey', fontsize=9)
+ax.set_xlim(0, 18); ax.set_ylim(73, 101)
+ax.set_xlabel('Years (if every day were like this)'); ax.set_ylabel('State of health (%)')
+ax.grid(alpha=0.3); [ax.spines[s].set_visible(False) for s in ('top', 'right')]
+ax.legend(frameon=False, fontsize=9.5, loc='upper right')
+ax.set_title('State of health: normal day vs heat wave', loc='left', fontsize=12)
+fig.tight_layout(); plt.show()
+
+Ah_day = np.trapezoid(np.abs(I), t) / 3600
+FEC    = Ah_day / (2 * Q_nom)
+Is     = 140.0  # A, linearization point (0.5C)
+
+print("=== Thermal model ===")
+print(f"tau = m cp / UA            = {tau:.0f} s = {tau/60:.1f} min")
+print(f"Gain, cooler -> T (Kp)     = {-1/UA:.3f} K/W")
+print(f"Gain, current -> T at 140 A = {2*Is*R0/UA:.4f} K/A")
+print(f"Gain, air -> T             = 1 K/K")
+print()
+print("=== Current profile ===")
+print(f"Max |I|                    = {np.abs(I).max():.1f} A")
+print(f"Throughput                 = {Ah_day:.0f} Ah/day  ({np.trapezoid(np.clip(-I,0,None),t)/3600:.0f} charge, {np.trapezoid(np.clip(I,0,None),t)/3600:.0f} discharge)")
+print(f"Full equivalent cycles     = {FEC:.2f} per day")
+print(f"Peak I^2 R heat            = {(I**2*R0).max():.2f} W")
+print()
+print("=== Temperatures (no control) ===")
+print(f"Cloudy day: cell peak {T_norm.max():.2f} C, max rise over air {(T_norm - T_air_normal(h)).max():.2f} C")
+print(f"Heat wave:  cell peak {T_hot.max():.2f} C, mean {T_hot.mean():.2f} C")
+print()
+print("=== Arrhenius factors (1.00 = 25 C) ===")
+w = np.abs(I)
+print(f"Cloudy day: cycle (current-weighted) {np.average(f_arr(T_norm,Ea_cyc),weights=w):.2f}, calendar (time avg) {f_arr(T_norm,Ea_cal).mean():.2f}")
+print(f"Heat wave:  cycle (current-weighted) {np.average(f_arr(T_hot,Ea_cyc),weights=w):.2f}, calendar (time avg) {f_arr(T_hot,Ea_cal).mean():.2f}")
+print()
+print("=== Capacity lost per day (%) ===")
+print(f"{'':12s}{'cycle':>10s}{'calendar':>10s}{'total':>10s}")
+print(f"{'Cloudy day':12s}{cyc_n[-1]:10.4f}{cal_n[-1]:10.4f}{loss_n[-1]:10.4f}")
+print(f"{'Heat wave':12s}{cyc_h[-1]:10.4f}{cal_h[-1]:10.4f}{loss_h[-1]:10.4f}")
+print(f"{'Held at 25C':12s}{k_cyc*FEC:10.4f}{k_cal:10.4f}{k_cyc*FEC + k_cal:10.4f}")
+print(f"Heat wave ages the cell {100*(loss_h[-1]/loss_n[-1]-1):.0f}% faster")
+
+# ---------------------------------------------------------------------------
+# 6. PLOT
+# ---------------------------------------------------------------------------
+c_n, c_h = "#2B87B8", "#D9603B"
+fig, (a1, a2) = plt.subplots(2, 1, figsize=(8, 6.4), sharex=True,
+                             gridspec_kw=dict(height_ratios=[1.35, 1], hspace=0.2))
+a1.plot(h, T_air_heatwave(h), c_h, lw=1.2, ls="--")
+a1.plot(h, T_hot, c_h, lw=2.4, label="Heat wave")
+a1.plot(h, T_air_normal(h), c_n, lw=1.2, ls="--")
+a1.plot(h, T_norm, c_n, lw=2.4, label="Cloudy day")
+a1.axhline(25, color="grey", lw=1, ls=":")
+a1.set_ylabel("Temperature (°C)")
+a1.set_title("Cell temperature (solid) and air (dashed), no control", loc="left")
+a1.legend(frameon=False)
+
+a2.plot(h, loss_h * 1e3, c_h, lw=2.4, label=f"Heat wave: {loss_h[-1]:.4f}%")
+a2.plot(h, loss_n * 1e3, c_n, lw=2.4, label=f"Cloudy day: {loss_n[-1]:.4f}%")
+a2.set_ylabel("Capacity lost\n(thousandths of a %)")
+a2.set_xlabel("Time of day (h)")
+a2.set_title("Capacity lost so far today", loc="left")
+a2.set_xlim(0, 24); a2.set_xticks([0, 6, 12, 18, 24])
+a2.legend(frameon=False, loc="upper left")
+for ax in (a1, a2):
+    ax.grid(axis="y", alpha=0.3)
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+plt.show()
