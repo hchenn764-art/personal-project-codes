@@ -1,0 +1,121 @@
+/* Name: main.c
+ * Author: Howe Chen
+ * Copyright: Don't copyright me pls
+ * License: NA
+ */
+
+#include "MEAM_general.h"  
+#include "m_usb.h"        
+
+void adc_select(uint8_t ch)
+{
+    if (ch & 0x01)
+	set(ADMUX, MUX0);               // set MUX0 to 0 if 0
+    else          
+	clear(ADMUX, MUX0);
+
+    if (ch & 0x02) 
+	set(ADMUX, MUX1);    		// set MUX1 to 0 if 0
+    else           
+	clear(ADMUX, MUX1);
+
+    if (ch & 0x04) 
+	set(ADMUX, MUX2);   		 // set MUX2 to 0 if 0
+    else           
+	clear(ADMUX, MUX2);
+
+
+    if (ch & 0x08) 
+	set(ADCSRB, MUX5);  		 // set MUX5 to 0 if 0
+    else           
+	clear(ADCSRB, MUX5);
+
+    clear(ADMUX, MUX3);                  // set MUX3 and MUX4 to 0 because ground
+    clear(ADMUX, MUX4);
+}
+
+void adc_setup(uint8_t ch)
+{
+    set(ADMUX, REFS0);                  //  read 0V as 0 and 5V as 1023
+    clear(ADMUX, REFS1);
+
+    set(ADCSRA, ADPS2);                 // use 128 prescaler to scale freq to abt 100 khz
+    set(ADCSRA, ADPS1);                 
+    set(ADCSRA, ADPS0);
+
+    adc_select(ch);
+    set(ADCSRA, ADEN);                  // select channel, turn ADC on
+}
+
+uint16_t adc_read(void)
+{
+    set(ADCSRA, ADSC);                  // start measurement
+    while (bit_is_set(ADCSRA, ADSC));   // wait until bit is turned off
+    return ADC;                         // return result
+}
+
+uint16_t adc_read_ch(uint8_t ch)
+{
+    adc_select(ch);     	       // switch the mux to this channel
+    adc_read();         	       // send first readings to void to get better signals
+    return adc_read();  	       // read adc port
+}
+
+void setup_servo(void)
+{
+    set(DDRB, 5);              // initialize PB5/6 as output pins for servo
+    set(DDRB, 6);              // 
+
+    ICR1 = 39999;               // 50 Hz at 0.5 us per tick
+
+    set(TCCR1A, WGM11);        // set PWM to mode 14 with TOP = ICR1
+    set(TCCR1B, WGM12);
+    set(TCCR1B, WGM13);
+
+    set(TCCR1A, COM1A1);       // set PWM outputs to PB5/6
+    set(TCCR1A, COM1B1);    
+
+    set(TCCR1B, CS11);         // set prescaler to 8
+}
+
+int main(void)
+{
+
+
+    set(DIDR0, ADC7D);             // disable digital input on PF7/PF6 to reduce noise 
+    set(DIDR0, ADC6D);
+
+    _clockdivide(0);                    // full 16 MHz
+    m_usb_init();
+
+    MCUCR = (1 << JTD);        	       // turn off JTAG debug interface to ensure PF6/7 are read as analog inputs
+    MCUCR = (1 << JTD);		       // write twice so JTAG is actually turned off
+
+    setup_servo();                     // start reading PWM w/ servo
+
+    adc_setup(7);                       // connect to A0 for pot 1
+    adc_setup(6);                       // connect to A1 for pot 2
+
+    for (;;) {
+        uint16_t c1 = adc_read_ch(7);   // read pot on A0
+        uint16_t c2 = adc_read_ch(6);   // read pot on A1
+
+        int d1 = (long)c1 * 270 / 1023; // convert counts to degrees over 0 to 270
+        int d2 = (long)c2 * 270 / 1023; // using long prevents overflow error
+
+        m_usb_tx_string("J1: ");
+        m_usb_tx_uint(c1);
+        m_usb_tx_string(" counts, ");
+        m_usb_tx_int(d1);
+        m_usb_tx_string(" deg    J2: ");
+        m_usb_tx_uint(c2);
+        m_usb_tx_string(" counts, ");
+        m_usb_tx_int(d2);
+        m_usb_tx_string(" deg\r\n");
+
+        _delay_ms(50);                 // prevent overwhelming result by inputting delay
+
+        OCR1A = 1000 + (long)c1 * 4000 / 1023;   // update PB5 servo position
+        OCR1B = 1000 + (long)c2 * 4000 / 1023;   // update PB6 servo position
+    }
+}
