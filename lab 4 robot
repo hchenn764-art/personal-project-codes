@@ -1,0 +1,310 @@
+// ESP32-C3 robot: WiFi drive + PI speed control (TB6612FNG) + IR beacon detector
+// Encoder A -> GPIO 1, Encoder B -> GPIO 0, IR comparator output -> GPIO 4
+// WiFi "ESP32-Car" (pw 12345678) -> http://192.168.4.1
+// Serial Monitor @115200 (Tools > USB CDC On Boot > Enabled)
+
+#include <WiFi.h>
+#include <WebServer.h>
+
+// motor A pins = 5, 6, 7
+const int PWMA = 5;
+const int AIN2 = 6;
+const int AIN1 = 7;   
+
+// motor B pins = 8, 9, 10
+const int BIN1 = 8;
+const int BIN2 = 9;
+const int PWMB = 10; 
+
+// encoder/beacon gpio pins and variables 
+const int ENC_A_PIN = 1;
+const int ENC_B_PIN = 0;         
+const int BEACON_PIN = 4;         
+
+// pwm frequency, res, max/min duty
+const int PWM_FREQ = 1000;
+const int PWM_RES  = 10;         
+const int MAX_DUTY = 1023;
+const int MIN_DUTY = 500;    // min duty allows setting s = 1 to overcome motor friction
+
+// encoder variables
+const int SLOTS = 20;
+const unsigned long DEBOUNCE = 3000;    // pin change must last 3 ms to enact change
+const unsigned long STALL_US = 300000;  // no slot for 0.3 s, reset the speed to s = 0
+
+// pi variables
+const float MAX_RPS = 4.0;          // measured max_rps from past trials
+const float KP      = 350.0;        // P gain 
+const float KI      = 900.0;        // I gain
+const unsigned long LOOP_MS = 50;   // controller updates error every 50 ms
+
+const char* SSID = "ESP32-Car";     // WiFi name
+const char* PASS = "12345678";      // WiFI password
+
+WebServer server(80);
+unsigned long lastCmd = 0;
+const unsigned long TIMEOUT_MS = 1000;
+
+// wheel structure to apply to wheels A and B
+struct Wheel {
+  const char* name;
+  int pwm, in1, in2, enc;      
+  int cmd = 0;
+  long count = 0;
+  int count_dir = 1;
+  unsigned long lastEdgeUs = 0, periodUs = 0;
+  int last_read = LOW, stable_state = LOW;
+  unsigned long last_change = 0;
+  float rps = 0, target = 0, integral = 0;
+  int duty = 0, lastDir = 0;
+  Wheel(const char* n, int p, int i1, int i2, int e) : name(n), pwm(p), in1(i1), in2(i2), enc(e) {}
+};
+
+Wheel A("A", PWMA, AIN1, AIN2, ENC_A_PIN);
+Wheel B("B", PWMB, BIN1, BIN2, ENC_B_PIN);
+
+// ir beacon initialization
+const uint32_t BEACON_MIN_PERIOD_US = 800;    // ignore glitches faster than ~1.25 kHz to prevent noise leakage
+const uint32_t BEACON_TIMEOUT_US    = 100000; // no edge for 100 ms -> no beacon
+
+volatile uint32_t bLastEdge = 0;                   // time of most recent rising edge
+volatile uint32_t bPeriods[8];                     // take last 8 periods to find a median
+volatile uint8_t  bIdx = 0;                        // index for periods
+volatile uint8_t  bCount = 0;                      // count for stored periods to reset at 7
+portMUX_TYPE bMux = portMUX_INITIALIZER_UNLOCKED;  // lock so interrupt + loop don't touch the buffer at once
+
+String beaconState = "NONE";                       // "25 Hz", "662 Hz" or "NONE"
+float  beaconFreq  = 0;                            // measured frequency
+
+void IRAM_ATTR onBeaconEdge() {
+  uint32_t now = micros();                         // now = current time in us
+  uint32_t p = now - bLastEdge;                    // p = time from last edge to now, or one period
+  if (p < BEACON_MIN_PERIOD_US) return;            // if p is a extraordinarily fast signal, ignore it and return the function
+  portENTER_CRITICAL_ISR(&bMux);
+  bLastEdge = now;
+  bPeriods[bIdx] = p;                              // update now and record the period 
+  bIdx = (bIdx + 1) % BEACON_N;                    // move to the next slot and wrap around after 7 with %
+  if (bCount < BEACON_N) bCount++;                 // max out stored periods at 8
+  portEXIT_CRITICAL_ISR(&bMux);
+}
+
+void updateBeacon() {
+  static uint32_t lastRun = 0;
+  if (millis() - lastRun < 100) return;  
+  lastRun = millis();
+
+  uint32_t buf[8];                            // copy of periods, number of periods stored, time of last edge
+  uint8_t n;
+  uint32_t last;
+
+  portENTER_CRITICAL(&bMux);                  // lock the interrupt 
+  n = bCount;                                 // copy number of periods and time of last edge
+  last = bLastEdge;
+  for (int i = 0; i < n; i++) buf[i] = bPeriods[i];      // copy each stored period into array buf   
+  if (micros() - last > BEACON_TIMEOUT_US) bCount = 0;   // if beacon gone > 100 ms, clear stored count b/c long time btwn signals
+  portEXIT_CRITICAL(&bMux);                   // unlock interrupt to continue getting data
+
+  String newState;
+  if (micros() - last > BEACON_TIMEOUT_US || n < 3) {       // no edge in 100 ms OR too few periods collected -> no signal picked up, output none
+    newState = "NONE";
+    beaconFreq = 0;
+  } else {
+    for (int i = 1; i < n; i++) {                           // insertion sort algorithm to find the median
+      uint32_t key = buf[i];
+      int j = i - 1;
+      while (j >= 0 && buf[j] > key) { buf[j + 1] = buf[j]; j--; }
+      buf[j + 1] = key;
+    }
+    beaconFreq = 1e6f / buf[n / 2];                         // take the median, and if it is within a certain range, output the state of the signal
+    if (beaconFreq > 20 && beaconFreq < 30)        newState = "25 Hz";
+    else if (beaconFreq > 560 && beaconFreq < 760) newState = "662 Hz";
+    else                                           newState = "NONE";
+  }
+
+  if (newState != beaconState) {                // print new state of it is different from the old state
+    beaconState = newState;
+    Serial.printf(">> BEACON: %s (%.1f Hz)\n", beaconState.c_str(), beaconFreq);
+  }
+}
+
+// wheel code
+
+void setMotorDuty(Wheel &w, int dir, int duty) {      // set code to change directinoality of the two wheels
+  if (dir > 0)      { digitalWrite(w.in1, HIGH); digitalWrite(w.in2, LOW);  }
+  else if (dir < 0) { digitalWrite(w.in1, LOW);  digitalWrite(w.in2, HIGH); }
+  else              { digitalWrite(w.in1, LOW);  digitalWrite(w.in2, LOW); duty = 0; }
+  ledcWrite(w.pwm, constrain(duty, 0, MAX_DUTY));     
+}
+
+int openLoopDuty(int s) {               // for feedforward controller; map a speed s to a duty from 500 - 1023
+  if (s == 0) return 0;
+  return MIN_DUTY + abs(s) * (MAX_DUTY - MIN_DUTY) / 100;
+}
+
+void readEncoder(Wheel &w) {           
+  int r = digitalRead(w.enc);           // read encoder pin, and if it changed, change its value
+  if (r != w.last_read) {
+    w.last_read = r;
+    w.last_change = micros();
+  } else if (r != w.stable_state && micros() - w.last_change > DEBOUNCE) {      // if its the same as the last read but differs from the accepted state and held for > 3 ms
+    w.stable_state = r;
+    if (r == HIGH) {
+      w.count += w.count_dir;                                         // update the count based on direction (+1 forward, -1 reverse)
+      unsigned long now = micros();
+      if (w.lastEdgeUs != 0) w.periodUs = now - w.lastEdgeUs;         // measure time btwn change
+      w.lastEdgeUs = now;
+    }
+  }
+}
+
+float measureRps(Wheel &w) {                                          // convert slot changes -> wheel spd in rps
+  if (w.periodUs == 0 || micros() - w.lastEdgeUs > STALL_US) return 0;
+  return 1e6 / ((float)w.periodUs * SLOTS);
+}
+
+void controlWheel(Wheel &w) {                 // PI Controller for one wheel, runs every 50 ms
+  const float dt = LOOP_MS / 1000.0;          // time step in s
+  w.rps = 0.7 * w.rps + 0.3 * measureRps(w);  // software low-pass filter; 70% old speed + 30% new speed to reduce noise
+
+  int dir = (w.cmd > 0) - (w.cmd < 0);        // find direction of command
+  if (dir != 0) w.count_dir = dir;
+  w.target = fabs(w.cmd) / 100.0 * MAX_RPS;   // set a target speed 
+
+  if (dir == 0 || dir != w.lastDir) w.integral = 0;
+  w.lastDir = dir;
+
+  if (dir == 0) {                    
+    w.duty = 0;
+  } else {
+    float err = w.target - w.rps;             // calculate error btwn target and actual speed
+    w.integral += err * dt;                   // set integral value
+    float iMax = MAX_DUTY / (float)KI;        // cap KI * Integral at 1023 s.t. it doesn't blow out of proportion
+    w.integral = constrain(w.integral, -iMax, iMax);    // anti-windup portion to stop integral from growing forever
+    float ff = openLoopDuty(w.cmd);           // feedforward implementation
+    w.duty = constrain((int)(ff + KP * err + KI * w.integral), 0, MAX_DUTY);        // output the final duty from FF + integral
+  }
+  setMotorDuty(w, dir, w.duty);         // apply change to motor
+}
+
+// webpage code - we control the robot with arrow keys for mvo
+const char PAGE[] PROGMEM = R"HTML(
+<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{font-family:sans-serif;text-align:center;margin:20px;background:#111;color:#eee;user-select:none}
+input[type=range]{width:90%;height:40px}
+.v{font-size:2em;margin:4px}
+.pad{display:grid;grid-template-columns:repeat(3,80px);grid-gap:8px;justify-content:center;margin:20px auto}
+.pad button{height:80px;font-size:2em;background:#333;color:#fff;border:0;border-radius:10px;touch-action:none}
+.pad button.on{background:#2a7}
+#stop{font-size:1.4em;padding:12px 40px;background:#c33;color:#fff;border:0;border-radius:8px}
+.h{color:#999;font-size:.85em}
+#st{font-family:monospace;color:#7cf;white-space:pre}
+</style></head><body>
+<h2>ESP32 Motor Control</h2>
+<p>Speed</p><div class="v" id="sv">60</div>
+<input type="range" id="spd" min="0" max="100" value="60">
+<div class="pad">
+  <span></span><button data-k="up">&#9650;</button><span></span>
+  <button data-k="left">&#9664;</button><button data-k="down">&#9660;</button><button data-k="right">&#9654;</button>
+</div>
+<p class="h" id="w">A 0 | B 0</p>
+<p id="st">-</p>
+<button id="stop" onclick="clearKeys()">STOP</button>
+<script>
+const TURN_RATIO = 0.3;
+const spd=document.getElementById('spd');
+const keys={up:0,down:0,left:0,right:0};
+const keyMap={ArrowUp:'up',ArrowDown:'down',ArrowLeft:'left',ArrowRight:'right',
+              w:'up',s:'down',a:'left',d:'right',W:'up',S:'down',A:'left',D:'right'};
+function compute(){
+  const S=+spd.value, f=keys.up-keys.down, t=keys.right-keys.left;
+  let a=0,b=0;
+  if(f){ a=b=f*S; if(t>0) b=f*S*TURN_RATIO; if(t<0) a=f*S*TURN_RATIO; }
+  else if(t){ a=t*S; b=-t*S; }
+  return [Math.round(a),Math.round(b)];
+}
+function send(){
+  const [a,b]=compute();
+  document.getElementById('sv').textContent=spd.value;
+  document.getElementById('w').textContent='A '+a+' | B '+b;
+  document.querySelectorAll('.pad button').forEach(x=>x.classList.toggle('on',!!keys[x.dataset.k]));
+  fetch('/set?a='+a+'&b='+b).then(r=>r.text())
+    .then(t=>document.getElementById('st').textContent=t).catch(()=>{});
+}
+function setKey(k,v){ if(keys[k]!==v){keys[k]=v;send();} }
+function clearKeys(){ for(const k in keys) keys[k]=0; send(); }
+document.addEventListener('keydown',e=>{const k=keyMap[e.key]; if(k){e.preventDefault(); setKey(k,1);}});
+document.addEventListener('keyup',e=>{const k=keyMap[e.key]; if(k){e.preventDefault(); setKey(k,0);}});
+window.addEventListener('blur',clearKeys);
+document.querySelectorAll('.pad button').forEach(btn=>{
+  const k=btn.dataset.k;
+  btn.addEventListener('pointerdown',e=>{e.preventDefault(); setKey(k,1);});
+  ['pointerup','pointerleave','pointercancel'].forEach(ev=>btn.addEventListener(ev,()=>setKey(k,0)));
+});
+spd.oninput=send;
+setInterval(send,300);
+send();
+</script></body></html>
+)HTML";
+
+// code for the website and to output the speed, beacon reading, duty, target/measured speed, etc.
+void handleRoot() { server.send_P(200, "text/html", PAGE); }
+
+void handleSet() {
+  int a = constrain(server.hasArg("a") ? server.arg("a").toInt() : 0, -100, 100);
+  int b = constrain(server.hasArg("b") ? server.arg("b").toInt() : 0, -100, 100);
+  if (a != A.cmd || b != B.cmd) Serial.printf(">> new cmd: A=%d  B=%d\n", a, b);
+  A.cmd = a; B.cmd = b;
+  lastCmd = millis();
+  char buf[200];
+  snprintf(buf, sizeof(buf),
+           "A tgt %.2f meas %.2f duty %d\nB tgt %.2f meas %.2f duty %d\nBeacon: %s (%.1f Hz)",
+           A.target, A.rps, A.duty, B.target, B.rps, B.duty, beaconState.c_str(), beaconFreq);
+  server.send(200, "text/plain", buf);
+}
+
+// setup and loop commands
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(AIN1, OUTPUT); pinMode(AIN2, OUTPUT);         // initialize the output pins for motor driver
+  pinMode(BIN1, OUTPUT); pinMode(BIN2, OUTPUT); 
+  ledcAttach(PWMA, PWM_FREQ, PWM_RES);                  // initialize pwm pins w/ freq and res
+  ledcAttach(PWMB, PWM_FREQ, PWM_RES);            
+  setMotorDuty(A, 0, 0);                                // initialize motor duties to 0 (Start at 0 spd)
+  setMotorDuty(B, 0, 0);
+
+  pinMode(ENC_A_PIN, INPUT);    // set encoder pins to enc a and enc b and initialize as inputs                 
+  pinMode(ENC_B_PIN, INPUT);
+
+  pinMode(BEACON_PIN, INPUT);   // initialize beacon pin as input 
+  attachInterrupt(digitalPinToInterrupt(BEACON_PIN), onBeaconEdge, RISING);  // every time beacon goes from low -> high (rising edges), measure the period
+
+  WiFi.softAP(SSID, PASS);
+  Serial.print("Go to: http://");
+  Serial.println(WiFi.softAPIP());
+
+  server.on("/", handleRoot);
+  server.on("/set", handleSet);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+  readEncoder(A);               // loop reading the two encoders, updating the beacon
+  readEncoder(B);
+  updateBeacon();
+
+  if (millis() - lastCmd > TIMEOUT_MS && (A.cmd || B.cmd)) {        // turn off speed if the arrow keys are not pressured 
+    A.cmd = 0; B.cmd = 0;
+    Serial.println("!! failsafe: no command for 1 s -> stop");
+  }
+
+  static unsigned long lastCtrl = 0;        // implement the pi controller
+  if (millis() - lastCtrl >= LOOP_MS) {
+    lastCtrl = millis();
+    controlWheel(A);
+    controlWheel(B);
+  }
+}
